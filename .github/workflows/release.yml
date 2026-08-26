@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Immutable Git tag to verify and optionally release (for example, v0.1.0)
+        required: true
+        type: string
+      publish:
+        description: Publish the verified Linux binaries as a GitHub Release
+        required: true
+        default: false
+        type: boolean
+      immutable_releases_confirmed:
+        description: Confirm repository release immutability is enabled before publication
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Serialize verification and publication so two dispatches cannot mutate the
+# same draft or race between tag, digest, and release checks.
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate immutable version tag
+        env:
+          VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+          IMMUTABLE_RELEASES_CONFIRMED: ${{ inputs.immutable_releases_confirmed }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" != "tag" || "$VERSION" != "$GITHUB_REF_NAME" ]]; then
+            echo "Dispatch this workflow from the immutable Git tag named by the version input." >&2
+            exit 1
+          fi
+          python3 - "$VERSION" <<'PY'
+          import re
+          import sys
+
+          version = sys.argv[1]
+          match = re.fullmatch(
+              r"v(0|[1-9][0-9]*)\."
+              r"(0|[1-9][0-9]*)\."
+              r"(0|[1-9][0-9]*)"
+              r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?",
+              version,
+          )
+          if match is None:
+              raise SystemExit("version must use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE")
+          prerelease = match.group(4)
+          if prerelease:
+              for identifier in prerelease.split("."):
+                  if identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0"):
+                      raise SystemExit("numeric prerelease identifiers must not contain leading zeroes")
+          PY
+          if [[ "$(git rev-list -n 1 "$VERSION")" != "$GITHUB_SHA" ]]; then
+            echo "Checked-out tag does not resolve to this workflow revision." >&2
+            exit 1
+          fi
+          if [[ "$PUBLISH" == "true" && "$IMMUTABLE_RELEASES_CONFIRMED" != "true" ]]; then
+            echo "Publication requires explicit confirmation that repository release immutability is enabled." >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.22.12'
+
+      - name: Verify source
+        run: |
+          test -z "$(gofmt -l ./*.go)"
+          bash -n scripts/publish-release.sh
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Build static Linux binaries
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          release_version="${VERSION#v}"
+          for arch in amd64 arm64; do
+            output="dist/headscale-ops_${release_version}_linux_${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags="-s -w -X main.buildVersion=${VERSION} -X main.buildRevision=${GITHUB_SHA}" \
+              -o "$output" .
+            chmod 0755 "$output"
+            file "$output" | grep -q 'statically linked'
+          done
+
+      - name: Set up ARM64 emulation
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+
+      - name: Smoke test both architectures
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          release_version="${VERSION#v}"
+          for arch in amd64 arm64; do
+            binary="dist/headscale-ops_${release_version}_linux_${arch}"
+            test "$("$binary" version)" = "headscale-ops ${VERSION} (${GITHUB_SHA})"
+            "$binary" --help >/dev/null
+          done
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum headscale-ops_*_linux_amd64 headscale-ops_*_linux_arm64 >SHA256SUMS
+          sha256sum --check SHA256SUMS
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 3
+
+      - name: Preserve verified release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: headscale-ops-release-${{ github.sha }}
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    if: ${{ inputs.publish == true && inputs.immutable_releases_confirmed == true }}
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: headscale-ops-release-${{ github.sha }}
+          path: dist
+
+      - name: Verify downloaded assets
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          release_version="${VERSION#v}"
+          test -f "dist/headscale-ops_${release_version}_linux_amd64"
+          test -f "dist/headscale-ops_${release_version}_linux_arm64"
+          test -f dist/SHA256SUMS
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
+          (cd dist && sha256sum --check SHA256SUMS)
+
+      - name: Stage, verify, and publish immutable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: scripts/publish-release.sh

@@ -1,0 +1,6 @@
+headscale-ops
+*.test
+coverage.out
+*.key
+*.crt
+*.pem
