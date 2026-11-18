@@ -120,6 +120,8 @@ make install
 
 The default install path is `~/.local/bin/headscale-ops`. A source build reports `dev` unless `VERSION` and `REVISION` are supplied explicitly.
 
+See [Contributing](./CONTRIBUTING.md) for the development prerequisites and local checks.
+
 ## Upgrade and uninstall
 
 To upgrade, repeat the checksum-verified release installation with a newer immutable `VERSION`. The final `install` command replaces the executable only after the new download has passed checksum verification. Run `headscale-ops version` afterward.
